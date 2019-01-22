@@ -15,19 +15,32 @@ OBJ
 
   hw:           "hardware"
   tx:           "txx"
+  so2:          "syncser"
 
 VAR
   long  tx_cmd_ptr              ' Pointer to store commands for debug output
+  byte  so2buffer[64]           ' Buffer for data from SO2
   
 PUB main
 
-  tx.Start(hw#pin_TX, 1_000_000)
+  ' The synchronous serial port runs at approximately 380 kbits/second. It's
+  ' not continously active but an obvious safe value for the TXX baud rate is
+  ' going to be twice that bitrate.
+  tx_cmd_ptr := tx.Start(hw#pin_TX, 1_000_000)
 
-  tx.Str(string("Hello, World!",13))
+  ' Announce us and make sure TXX is settled
+  waitcnt(CLKFREQ * 5 + CNT)
+  tx.Str(string("DCC-175 synchronous serial analyzer",13))
+  tx.Wait
 
+  ' Start the serial monitor for the output channel 
+  so2.Start(hw#pin_SCK2, hw#pin_SO2, hw#pin_LED1, @so2buffer, 32, tx_cmd_ptr) 
+    
+  ' Wake up the DCC recorder
   OUTA[hw#pin_WAKEUP]:=0
   DIRA[hw#pin_WAKEUP]:=1
-  
+
+  ' Loop forever  
   repeat while true
               
 DAT

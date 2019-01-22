@@ -35,6 +35,7 @@
 OBJ
 
   hw:           "hardware"
+  
 
 VAR
 
@@ -174,7 +175,10 @@ syncser
 
                         ' Set the direction register
                         mov     DIRA, mask_TIMER
-                        
+
+                        ' Initialize byte-writing variables
+                        mov     current_buffer, parm_buffer
+                                                
 err_low_timeout
 err_too_many_bits
 err_not_enough_bits
@@ -187,7 +191,8 @@ reset
                         ' Clear current byte
                         mov     current_byte, #0
 
-'@@@ clear buffer
+                        ' Start storing data at start of the current buffer
+                        mov     current_location, current_buffer
                          
                         ' Set timer B to a long timeout. If nothing happens
                         ' before it triggers, we're offline.
@@ -261,56 +266,75 @@ waitforlow
               if_z      jmp     #process_byte
 
                         ' If there were 8 bit times after the last LOW pulse,
-                        ' this is the end of a packet.
+                        ' this is the end of a packet. Otherwise, keep looping.
                         cmp     num_high_timeouts, #8 wz ' ZF=1 if 8 timeouts
-              if_z      jmp     #process_packet
+              if_nz     jmp     #waitforlow
 
-                        ' If there were more than 8 timeouts, just loop until
-                        ' the next packet.
-                        '
-                        ' To prevent wrap-around, use a MAX on the counter.
-                        ' TODO: Use a much higher maximum and set status to
-                        ' OFFLINE if we reach the max.
-                        max     num_high_timeouts, #9 wc ' CF=0 if maximum reached                        
-                        jmp     #waitforlow 
+process_packet                                    
+                        ' We've detected the end of a packet.
+                        ' Send a TXX huxdump command to the output pointer.
+                        '                        
+                        ' Determine length.
+                        ' If there's nothing in the buffer, reset.
+                        ' TODO: If this happens a few times, signal OFFLINE state
+                        mov     x, current_location
+                        sub     x, current_buffer wz    ' x=current length
+              if_z      jmp     #reset                                  
 
-                        ' Store the current byte into the current packet
+                        ' Process into a command for TXX
+                        shl     x, #16                  ' Move length to high word
+                        or      x, current_buffer       ' Add the 16-bit address
+                        or      x, v80000000            ' Set high bit for hexdump
+                        wrlong  x, parm_outdataptr      ' Start dumping
+
+                        ' Now switch to the other buffer
+                        cmp     current_buffer, parm_buffer wz ' ZF=1 when using first buffer
+                        mov     current_buffer, parm_buffer
+              if_z      add     current_buffer, parm_packetlen
+
+                        ' Reset the parser
+                        ' This also resets the current store pointer
+                        jmp     #reset                                                                    
+
 process_byte
+                        ' Store the current byte into the current packet
+                        '
                         ' Make sure the byte has been received completely
                         cmp     bit_count, #8 wc        ' CF=1 not enough bits
               if_c      jmp     #err_not_enough_bits 
 
                         ' Make sure there's space in the current buffer
-                        cmp     current_pktlen, parm_packetlen wc ' CF=0 buffer overflow
-              if_nc     jmp     #err_buffer_overflow                                                
+                        mov     x, current_location
+                        sub     x, current_buffer       ' x=current length
+                        cmp     x, parm_packetlen wc    ' CF=0 if at max packet len
+              if_nc     jmp     #err_buffer_overflow           
 
-'@@@
-process_packet                                    
+                        ' Store the current byte
+                        shr     current_byte, #24       ' Shift to lowest 8 bits
+                        wrbyte  current_byte, current_location
+                        add     current_location, #1
 
-
-
-
-
+                        jmp     #waitforlow
 
 startlow
                         ' At this point, SCK is LOW.
+                        ' TODO: reset OFFLINE state
+                        '
                         ' While timer A measures the duration of the LOW
                         ' pulse, we don't have anything to do but wait
                         ' until SCK goes HIGH again.
                         mov     PHSB, offline_timeout
 waitforhigh
-                        ' TODO: Reset OFFLINE status?
-                        
                         ' Wait for Not(SCK LOW and Timer pin LOW)
                         ' In other words: Wait for SCK=HIGH or Timer=HIGH
                         ' Once that happens, sample the inputs immediately
                         ' so the serial data line is read at (pretty much)
                         ' the same time as the serial clock goes HIGH.
                         waitpne zero, mask_SCK_TIMER
-                        mov     cache, INA
+                        mov     x, INA
 
                         ' If SCK still low, it means we got a timeout
-                        test    mask_SCK, cache wz      ' ZF=1 if SCK low
+                        test    mask_SCK, x wz          ' ZF=1 if SCK low
               if_z      jmp     #err_low_timeout
 
                         ' SCK is definitely HIGH.
@@ -321,7 +345,7 @@ waitforhigh
               if_nc     jmp     #err_too_many_bits              
 
                         ' Rotate data into current byte
-                        test    cache, mask_DATA wc     ' CF=1 if data bit=1
+                        test    x, mask_DATA wc         ' CF=1 if data bit=1
                         rcr     current_byte, #1
                                                 
                         ' Increase bit count
@@ -334,7 +358,8 @@ waitforhigh
                         jmp     #starthigh                                                       
 
                         ' Constants
-zero                    long    0                       ' Zero                        
+zero                    long    0                       ' Zero
+v80000000               long    $80000000               ' High bit set                        
 vFFFFFFFF               long    $FFFFFFFF               ' -1                        
 init_CTRA               long    (%01100 << 26)          ' Count LOW time. SCK pin to be added
 init_CTRB               long    (%00100 << 26)          ' Generate timeout on pin. Pin to be added
@@ -348,14 +373,14 @@ parm_packetlen          long    0                       ' Max packet length in b
 parm_outdataptr         long    0                       ' Output data pointer                                
 
                         ' Uninitialized variables
-cache                   res     1                       ' INA right after SCK went HIGH                        
+x                       res     1                       ' Multi-purpose scratch variable                        
 mask_TIMER              res     1                       ' Bitmask for timer pin                        
 mask_SCK                res     1                       ' Bitmask for serial clock pin
 mask_SCK_TIMER          res     1                       ' Bitmask for serial clock + timer pins
 mask_DATA               res     1                       ' Bitmask for serial data pin
 current_byte            res     1                       ' Byte value currently being received
-current_pktlen          res     1                       ' Number of bytes stored in current buf
 current_location        res     1                       ' Location to store next byte
+current_buffer          res     1                       ' Start of current buffer
 bit_count               res     1                       ' Number of bits in current byte
 num_high_timeouts       res     1                       ' Number of timeouts while SCK high        
 bit_time                res     1                       ' Measured half-bit time x2
