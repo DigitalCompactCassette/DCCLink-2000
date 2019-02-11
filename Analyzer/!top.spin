@@ -23,9 +23,7 @@ VAR
   
 PUB main
 
-  ' The synchronous serial port runs at approximately 380 kbits/second. It's
-  ' not continously active but an obvious safe value for the TXX baud rate is
-  ' going to be twice that bitrate.
+  ' The synchronous serial port runs at approximately 380 kbits/second.
   tx_cmd_ptr := tx.Start(hw#pin_TX, 1_000_000)
 
   ' Announce us and make sure TXX is settled

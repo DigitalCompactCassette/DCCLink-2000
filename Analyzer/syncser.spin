@@ -27,11 +27,34 @@
 '' as well as received traffic, use two instances of the module. The module
 '' also uses one pin as output line for a timer. Multiple instances that
 '' use the same serial clock input can also use the same timer output.
-'' 
-'' To analyze the data, the code uses both timers of the cog: one to measure
-'' the exact length of the negative pulse, and the other to detect the end
-'' of a byte or the end of a packet.
-''  
+CON 
+  ' To analyze the data, the code uses both timers of the cog: one to measure
+  ' the exact length of the negative pulse, and the other to detect the end
+  ' of a byte or the end of a packet. The timer multiplier and divider
+  ' constants can be used to adjust the expected timing accuracy: The length
+  ' of the LOW pulse is measured and multiplied by the multiplier, and the
+  ' divisor is used to set the timeout.
+  ' Example: if the LOW pulse takes 211 Propeller clocks, and the multiplier
+  ' is set to 3 and the divider is set to 2, a timeout occurs after approx.
+  ' (212 * 3) / 2 = 318 Propeller clocks.
+  ' The multiplier should be bigger than the divider; the closer they are,
+  ' the more clock accuracy the code expects. But higher values may cause
+  ' overflow (make sure the measured LOW pulse times the multiplyer is not
+  ' likely to be anywhere close to 2^31), and if the values are too high
+  ' (and expected accuracy too close), the execution of other code becomes
+  ' a major factor in distinguishing between a bit within a byte versus
+  ' the start of a new byte. Values that are too low may make the code
+  ' wait too long for a timeout and there may not be enough time left to
+  ' process the byte.  
+  con_MULTIPLIER  = 9
+  con_DIVIDER     = 8
+
+  ' To distinguish between a byte and a packet, the code waits the following
+  ' number of loops, times the measured LOW pulse time, times the multiplier
+  ' divided by the divider. This number should not be very critical but it
+  ' should be higher than the number of half-bit-times between two bytes.  
+  con_PKT_TIMEOUT = 10              
+
 OBJ
 
   hw:           "hardware"
@@ -88,7 +111,7 @@ PUB Start(clockpin, datapin, timerpin, buffer, packetlen, outdataptr)
   ' This is an easy way to store parameters but it's not safe if the function
   ' may be called from multiple cogs, because if multiple cogs run this code
   ' at the same time, they'll overwrite each others' parameters and at least
-  ' one of the syncser cogs will be misconfigured.
+  ' one of the syncser cogs may be misconfigured.
   ' To fix this, the parameters could be stored in VAR variables and passed
   ' to the cog via PAR. But the problem is not that urgent. I'll fix it
   ' later if necessary. 
@@ -100,7 +123,7 @@ PUB Start(clockpin, datapin, timerpin, buffer, packetlen, outdataptr)
   parm_outdataptr := outdataptr
 
   ' Start the cog  
-  result := (cog := cognew(@syncser, 0) + 1)
+  result := (cog := cognew(@syncser, @@0) + 1)
   
 pub Stop
 '' Stop the cog, if necessary
@@ -116,7 +139,7 @@ syncser
                         ' Init
 
                         ' Read the clock frequency from the hub
-                        rdlong  offline_timeout, #0     ' Read CLKFREQ
+                        mov     offline_timeout, minusone                        
 
                         ' Set the mask for the serial clock
                         mov     mask_SCK, #1
@@ -135,43 +158,17 @@ syncser
                         shl     mask_DATA, parm_pin_DATA
                         
                         ' Timer A is used to measure the length of the LOW
-                        ' pulses of the SCLK input. We set FRQA to 2 so that
-                        ' for each Propeller clock, PHSA is increased by 2.
-                        ' Since the serial clock is symmetrical (because it's
-                        ' in sync with the microcontroller clock), the result
-                        ' is that at the end of the LOW pulse, PHSA contains
-                        ' the total duration of one bit time (i.e. the LOW
-                        ' period plus the following HIGH period) of the serial
-                        ' clock, measured in Propeller clocks.
-                        ' NOTE: The measurement itself is accurate within
-                        ' 12.5 nanoseconds if the Propeller is running at
-                        ' 80MHz; however external factors such as jitter and
-                        ' interference could influence the measurement.
-                        ' However, the actual length of the serial clock pulse
-                        ' is mostly irrelevant: we just need the measured bit
-                        ' time to distinguish between bits within a byte,
-                        ' bytes that follow other bytes within the same
-                        ' packet, and the starts and ends of packets.                            
+                        ' pulses of the SCLK input.
                         movs    init_CTRA, parm_pin_SCK ' Set the pin number  
                         mov     CTRA, init_CTRA         ' Timer A measures LOW pulse
-                        mov     FRQA, #2                ' Timer A counts up in twos
+                        mov     FRQA, init_FRQA         ' Timer A step size
 
                         ' Timer B is used in NCO (numerically controlled
-                        ' oscillator) mode: the timer output pin is high
-                        ' when the most significant bit of PHSB is high.
-                        ' We set FRQB to $FFFFFFFF so that PHSB ends up
-                        ' counting backwards from the initial value, and when
-                        ' a timeout occurs, the PHSA value goes negative and
-                        ' the timer pin goes high. We use this to implement
-                        ' a wait-with-timeout using the WAITPNE instruction:
-                        ' basically whenever we want to wait until the serial
-                        ' clock goes LOW (HIGH) with a timeout, we store the
-                        ' timeout into the PHSB register and wait for the
-                        ' timer pin to not be 0 anymore, or the SCK pin to
-                        ' not be HIGH (LOW) anymore.
+                        ' oscillator) mode and is configured with a negative
+                        ' frequency value so that it counts down.
                         movs    init_CTRB, parm_pin_TIMER ' Set the pin number
                         mov     CTRB, init_CTRB         ' Timer B is NCO                                       
-                        mov     FRQB, vFFFFFFFF         ' Timer B counts down
+                        mov     FRQB, init_FRQB         ' Timer B counts down
 
                         ' Set the direction register
                         mov     DIRA, mask_TIMER
@@ -213,28 +210,11 @@ starthigh
                         mov     PHSA, #0
 
                         ' Reset the counter that keeps track of how long the
-                        ' serial clock stays high. The counter starts at 0
-                        ' and is increased for each time a timeout occurs,
-                        ' until it reaches 4. Then the counter is held at
-                        ' the same value by a MAX instruction so it doesn't
-                        ' overflow.
-                        '
-                        ' We use this counter to count the number of times
-                        ' that timer B expires before SCK goes LOW, basically
-                        ' measuring the high-time of SCK, expressed in
-                        ' bit-times:
-                        ' - If there is less than one bit-time between two
-                        '   LOW pulses, the new LOW pulse is a bit that's
-                        '   part of the same byte as the previous LOW pulse.
-                        ' - Otherwise, if there is less then three bit-times
-                        '   between twp LOW-pulses, the new LOW pulse is the
-                        '   start of a new byte within the same packet.
-                        ' - Otherwise, the end of a packet has been reached
-                        '   and it should be marked ready to process.
-                        ' The counter starts at 0 and is increased for every
-                        ' bit-time timeout in the following code, but a MAX
-                        ' instruction keeps it from overflowing.   
-                        mov     num_high_timeouts, #0
+                        ' serial clock stays high. The counter starts at -1
+                        ' and is increased for each time a timeout occurs.
+                        ' By starting with -1 we can detect the first loop
+                        ' with the zero flag after incrementing the counter.
+                        mov     num_high_timeouts, minusone
 waitforlow
                         ' Set timer B to the bit time measured during the
                         ' previous LOW pulse. If no previous measurements
@@ -258,16 +238,15 @@ waitforlow
                         ' of a packet.
                         '
                         ' Increase timeout counter
-                        add     num_high_timeouts, #1
-
                         ' If this was the first timeout after a LOW pulse,
-                        ' we should be at the end of a byte.
-                        cmp     num_high_timeouts, #1 wz ' ZF=1 if first timeout
+                        ' we're be at the end of a byte.
+                        add     num_high_timeouts, #1 wz ' ZF=1 if first timeout
               if_z      jmp     #process_byte
 
-                        ' If there were 8 bit times after the last LOW pulse,
-                        ' this is the end of a packet. Otherwise, keep looping.
-                        cmp     num_high_timeouts, #8 wz ' ZF=1 if 8 timeouts
+                        ' If there were too many bit times after the last LOW
+                        ' pulse, this is the end of a packet. Otherwise, keep
+                        ' looping.
+                        cmp     num_high_timeouts, #con_PKT_TIMEOUT wz ' ZF=1 if end of packet
               if_nz     jmp     #waitforlow
 
 process_packet                                    
@@ -279,12 +258,12 @@ process_packet
                         ' TODO: If this happens a few times, signal OFFLINE state
                         mov     x, current_location
                         sub     x, current_buffer wz    ' x=current length
-              if_z      jmp     #reset                                  
+              if_z      jmp     #reset                  ' Don't process if length=0                                  
 
                         ' Process into a command for TXX
                         shl     x, #16                  ' Move length to high word
                         or      x, current_buffer       ' Add the 16-bit address
-                        or      x, v80000000            ' Set high bit for hexdump
+                        or      x, txxcmd               ' Set command for TXX
                         wrlong  x, parm_outdataptr      ' Start dumping
 
                         ' Now switch to the other buffer
@@ -359,10 +338,12 @@ waitforhigh
 
                         ' Constants
 zero                    long    0                       ' Zero
-v80000000               long    $80000000               ' High bit set                        
-vFFFFFFFF               long    $FFFFFFFF               ' -1                        
+minusone                long    -1                      ' Negative 1
+txxcmd                  long    $20000000               ' Hexdump command for TXX module                        
 init_CTRA               long    (%01100 << 26)          ' Count LOW time. SCK pin to be added
+init_FRQA               long    con_MULTIPLIER          ' Timer A step size  (positive)
 init_CTRB               long    (%00100 << 26)          ' Generate timeout on pin. Pin to be added
+init_FRQB               long    - con_DIVIDER           ' Timer B step size (negative)       
 
                         ' Parameters
 parm_pin_SCK            long    0                       ' Pin number for serial clock input
@@ -385,7 +366,8 @@ bit_count               res     1                       ' Number of bits in curr
 num_high_timeouts       res     1                       ' Number of timeouts while SCK high        
 bit_time                res     1                       ' Measured half-bit time x2
 offline_timeout         res     1                       ' Copied from CLKFREQ (long[0])                                         
-                                                                         
+
+                        fit                                                                         
                                      
 CON     
 ''***************************************************************************
