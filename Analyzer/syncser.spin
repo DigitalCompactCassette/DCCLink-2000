@@ -139,7 +139,7 @@ syncser
                         ' Init
 
                         ' Read the clock frequency from the hub
-                        mov     offline_timeout, minusone                        
+                        rdlong  offline_timeout, #0                        
 
                         ' Set the mask for the serial clock
                         mov     mask_SCK, #1
@@ -293,6 +293,8 @@ process_byte
                         wrbyte  current_byte, current_location
                         add     current_location, #1
 
+                        mov     bit_count, #0
+                        mov     current_byte, #0
                         jmp     #waitforlow
 
 startlow
